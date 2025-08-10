@@ -1,0 +1,261 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>TXT → Imagen (Chunked, RGB/Grayscale)</title>
+<style>
+  body{font-family:system-ui,Arial;max-width:980px;margin:18px auto;padding:12px}
+  input, button, textarea {font-size:14px}
+  .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:8px 0}
+  #canvas{display:block;border:1px solid #999;margin-top:12px;max-width:100%}
+  #log{white-space:pre-wrap;background:#f7f7f7;border:1px solid #eee;padding:8px;height:120px;overflow:auto}
+  progress{width:100%}
+</style>
+</head>
+<body>
+  <h2>Convertir TXT → Imagen (RGB / grayscale)</h2>
+  <p class="small">Carga un archivo .txt con números (R,G,B por píxel o 1 valor/píxel grayscale). Acepta separadores: comas, espacios, saltos de línea.</p>
+
+  <div class="row">
+    <label>Archivo .txt: <input id="fileTxt" type="file" accept=".txt,text/plain"></label>
+    <button id="loadBtn">Cargar y analizar</button>
+    <button id="pasteBtn">Pegar desde portapapeles</button>
+  </div>
+
+  <div class="row">
+    <label>Ancho (px): <input id="w" type="number" min="1" style="width:120px"></label>
+    <label>Alto (px): <input id="h" type="number" min="1" style="width:120px"></label>
+    <button id="genBtn">Generar imagen</button>
+    <button id="dlBtn">Descargar PNG</button>
+  </div>
+
+  <progress id="prog" value="0" max="100" style="display:none"></progress>
+  <div id="log">Estado: esperando archivo...</div>
+
+  <canvas id="canvas"></canvas>
+
+<script>
+(function(){
+  const fileInput = document.getElementById('fileTxt');
+  const loadBtn = document.getElementById('loadBtn');
+  const pasteBtn = document.getElementById('pasteBtn');
+  const wIn = document.getElementById('w');
+  const hIn = document.getElementById('h');
+  const genBtn = document.getElementById('genBtn');
+  const dlBtn = document.getElementById('dlBtn');
+  const log = document.getElementById('log');
+  const prog = document.getElementById('prog');
+  const canvas = document.getElementById('canvas');
+  const ctx = canvas.getContext('2d');
+
+  let numbers = null; // Array of ints
+  let headerDetected = null; // {w,h} or null
+  let rawText = '';
+
+  function appendLog(s){ log.textContent = s; }
+
+  loadBtn.addEventListener('click', () => {
+    const f = fileInput.files[0];
+    if(!f) return alert('Selecciona un archivo .txt primero.');
+    appendLog('Leyendo archivo... ' + f.name);
+    const reader = new FileReader();
+    reader.onload = () => {
+      rawText = reader.result;
+      processRawText(rawText);
+    };
+    reader.onerror = (e) => appendLog('Error lectura: '+e);
+    reader.readAsText(f);
+  });
+
+  pasteBtn.addEventListener('click', async () => {
+    try {
+      const text = await navigator.clipboard.readText();
+      if(!text) return alert('Portapapeles vacío o contenido no texto.');
+      rawText = text;
+      processRawText(rawText);
+    } catch(e) {
+      alert('No se pudo leer portapapeles: ' + e);
+    }
+  });
+
+  function processRawText(txt){
+    appendLog('Analizando texto (extraer números)... Esto puede tardar si es muy grande.');
+    prog.style.display = 'block';
+    prog.value = 0;
+
+    // Primer intento: ver si primera línea tiene "WIDTH HEIGHT"
+    const lines = txt.split(/\r?\n/).map(l=>l.trim()).filter(l=>l.length>0);
+    headerDetected = null;
+    if(lines.length > 0) {
+      const firstParts = lines[0].split(/\s+/);
+      if(firstParts.length >= 2 && /^\d+$/.test(firstParts[0]) && /^\d+$/.test(firstParts[1])) {
+        headerDetected = { w: parseInt(firstParts[0],10), h: parseInt(firstParts[1],10) };
+        appendLog('Cabecera detectada: ' + headerDetected.w + ' x ' + headerDetected.h + ' (se usará si no cambias los inputs)');
+        // remove header from text for number extraction
+        txt = lines.slice(1).join(' ');
+      } else {
+        appendLog('No hay cabecera detectada. Por favor completa ancho/alto o añade primera línea "WIDTH HEIGHT".');
+      }
+    }
+
+    // Extraer números con regex (esto devuelve array de strings)
+    // Para grandes ficheros esto puede consumir memoria; aun así es la forma más fiable en navegador.
+    setTimeout(()=>{ // permitir que UI se actualice antes de empezar
+      try {
+        const matches = txt.match(/\d+/g);
+        if(!matches) {
+          numbers = [];
+          appendLog('No se encontraron números.');
+          prog.style.display='none';
+          return;
+        }
+        // Convertir a enteros (map puede bloquear; convertir en chunks)
+        numbers = new Uint32Array(matches.length);
+        let idx = 0;
+        const CH = 200000; // chunk size to convert progressively
+        function convChunk(i){
+          const end = Math.min(matches.length, i + CH);
+          for(let k=i;k<end;k++){
+            numbers[k] = parseInt(matches[k],10);
+          }
+          prog.value = Math.round((end / matches.length) * 100);
+          if(end < matches.length){
+            setTimeout(()=>convChunk(end), 0);
+          } else {
+            prog.style.display='none';
+            appendLog('Extracción completada. Números encontrados: ' + numbers.length + (headerDetected?(' (cabecera aplicada)'):''));
+            // Si detectamos header, autollenar inputs
+            if(headerDetected){
+              wIn.value = headerDetected.w;
+              hIn.value = headerDetected.h;
+            }
+          }
+        }
+        convChunk(0);
+      } catch(e){
+        appendLog('Error extrayendo números: ' + e);
+        prog.style.display='none';
+      }
+    }, 50);
+  }
+
+  // Generar imagen: llena ImageData en chunks para no bloquear UI
+  genBtn.addEventListener('click', () => {
+    if(!numbers || numbers.length === 0) return alert('Primero carga y procesa el archivo .txt.');
+    const w = parseInt(wIn.value,10);
+    const h = parseInt(hIn.value,10);
+    if(!w || !h) return alert('Introduce ancho y alto válidos (o añade cabecera al .txt).');
+
+    const totalNums = numbers.length;
+    // Detectar formato: grayscale (1 per pixel) o RGB (3 per pixel)
+    if (totalNums === w*h) {
+      renderGray(w,h);
+    } else if (totalNums === w*h*3) {
+      renderRGB(w,h);
+    } else {
+      // intentar detectar si los números están como "R,G,B,R,G..." pero separados por pixeles en strings: manejado ya
+      alert('La cantidad de números no coincide con w*h ni con w*h*3.\nNúmeros encontrados=' + totalNums + '\nEsperados (grayscale)=' + (w*h) + ' o (RGB)=' + (w*h*3) + '\nRevisa ancho/alto o formato del archivo.');
+    }
+  });
+
+  function renderRGB(w,h){
+    canvas.width = w; canvas.height = h;
+    const imgData = ctx.createImageData(w,h);
+    const out = imgData.data; // Uint8ClampedArray
+    const totalPixels = w*h;
+    appendLog('Generando imagen RGB: ' + totalPixels + ' píxeles. Esto puede tardar unos segundos.');
+
+    prog.style.display='block';
+    prog.value = 0;
+
+    const CHPIX = 20000; // píxeles por chunk (ajusta si hace falta)
+    let pi = 0; // pixel index
+    function chunk(){
+      const end = Math.min(totalPixels, pi + CHPIX);
+      let nIndex = pi * 3; // index en numbers
+      let outIndex = pi * 4;
+      for(let p=pi; p<end; p++){
+        const r = numbers[nIndex++]; const g = numbers[nIndex++]; const b = numbers[nIndex++];
+        out[outIndex++] = clampByte(r);
+        out[outIndex++] = clampByte(g);
+        out[outIndex++] = clampByte(b);
+        out[outIndex++] = 255;
+      }
+      prog.value = Math.round((end / totalPixels) * 100);
+      if(end < totalPixels){
+        pi = end;
+        setTimeout(chunk, 0);
+      } else {
+        ctx.putImageData(imgData, 0, 0);
+        prog.style.display='none';
+        appendLog('Imagen RGB generada. Puedes descargarla con "Descargar PNG".');
+      }
+    }
+    chunk();
+  }
+
+  function renderGray(w,h){
+    canvas.width = w; canvas.height = h;
+    const imgData = ctx.createImageData(w,h);
+    const out = imgData.data;
+    const total = w*h;
+    appendLog('Generando imagen grayscale: ' + total + ' píxeles.');
+
+    prog.style.display='block';
+    prog.value = 0;
+
+    const CH = 50000;
+    let i = 0;
+    function chunk(){
+      const end = Math.min(total, i + CH);
+      let nIdx = i;
+      let outIdx = i*4;
+      for(let p=i;p<end;p++){
+        const v = clampByte(numbers[nIdx++]);
+        out[outIdx++] = v;
+        out[outIdx++] = v;
+        out[outIdx++] = v;
+        out[outIdx++] = 255;
+      }
+      prog.value = Math.round((end / total) * 100);
+      if(end < total){
+        i = end;
+        setTimeout(chunk, 0);
+      } else {
+        ctx.putImageData(imgData, 0, 0);
+        prog.style.display='none';
+        appendLog('Imagen grayscale generada.');
+      }
+    }
+    chunk();
+  }
+
+  function clampByte(x){
+    if(!Number.isFinite(x)) return 0;
+    x = Math.round(x);
+    if(x < 0) return 0; if(x > 255) return 255; return x;
+  }
+
+  dlBtn.addEventListener('click', () => {
+    if(!canvas.width || !canvas.height) return alert('No hay imagen generada para descargar.');
+    const url = canvas.toDataURL('image/png');
+    const a = document.createElement('a');
+    a.href = url; a.download = 'reconstruida.png';
+    document.body.appendChild(a); a.click(); a.remove();
+  });
+
+  // soporte drag & drop del .txt
+  document.body.addEventListener('dragover', e=>e.preventDefault());
+  document.body.addEventListener('drop', e=> {
+    e.preventDefault();
+    if(e.dataTransfer.files && e.dataTransfer.files[0]){
+      fileInput.files = e.dataTransfer.files;
+      appendLog('Archivo pegado via drag&drop. Pulsa Cargar y analizar.');
+    }
+  });
+
+})();
+</script>
+</body>
+</html>
